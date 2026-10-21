@@ -1,16 +1,17 @@
-## Hi there 👋
+# GeoMem-VLA
 
-<!--
-**GeoMem-VLA/GeoMem-VLA** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+**Internalizing 3D Scene Understanding into Temporal Memory for Vision-Language-Action Models**
 
-Here are some ideas to get you started:
+GeoMem-VLA integrates 3D scene understanding with temporal memory for vision-language-action modeling.
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+[🤗 Hugging Face](https://huggingface.co/rxc205/GEOMEM-VLA)
+
+## 🚧 Coming Soon
+
+We are preparing the release of our model checkpoints, code, and documentation. Stay tuned for updates!
+
+- [ ] Model checkpoints
+- [ ] Training and inference code
+- [ ] Usage instructions and examples
+
+Thank you for your interest in GeoMem-VLA!
