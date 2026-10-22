@@ -1,0 +1,47 @@
+{
+  "status": "Manuscript-reported results; not re-evaluated for the public quick-start configuration",
+  "unit": "success_rate_percent",
+  "libero": {
+    "source": "tables/tab_libero_main.tex",
+    "trials_per_task": 50,
+    "tasks_per_suite": 10,
+    "spatial": 99.6,
+    "object": 99.8,
+    "goal": 99.6,
+    "long": 96.6,
+    "average": 98.9
+  },
+  "robotwin": {
+    "source": "tables/tab_robotwin_main.tex",
+    "tasks": 50,
+    "episodes_per_task_per_setting": 100,
+    "clean": 91.1,
+    "randomized": 91.24,
+    "average": 91.17
+  },
+  "ablations": {
+    "source": "tables/tab_ablation.tex",
+    "full": {
+      "libero_average": 98.9,
+      "robotwin_average": 91.17
+    },
+    "without_geometry_branch": {
+      "libero_average": 97.9,
+      "robotwin_average": 89.71
+    },
+    "without_temporal_memory": {
+      "libero_average": 98.2,
+      "robotwin_average": 90.18
+    }
+  },
+  "real_world": {
+    "source": "figures/task.pdf; sections/04_real_robot.tex",
+    "demonstrations_per_task": 60,
+    "rollouts_per_task": 10,
+    "pick_and_stand_sticks": 90,
+    "transfer_cup_across_rack": 70,
+    "separate_file_pockets": 100,
+    "pick_n_times_cube": 50,
+    "cover_and_find_apple": 80
+  }
+}

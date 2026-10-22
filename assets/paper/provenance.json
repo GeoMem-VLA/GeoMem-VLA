@@ -1,0 +1,49 @@
+{
+  "archive": "3D_Memory_VLA.zip",
+  "archive_sha256": "124d8a1801a7e6491c7fd1cf5ca007e96915118c1af448df634ee3c335bf0c8a",
+  "assets": {
+    "architecture.pdf": {
+      "source": "figures/GeoMemVLA_v4.pdf",
+      "sha256": "82a6f6d08572787bd2cae7b96c946d3e51e59b46ea8ea0b42f01e24df1ba0433"
+    },
+    "geometry_memory_case.pdf": {
+      "source": "figures/cases/case_figure.pdf",
+      "sha256": "1832a4c3206f5062b06bbacb03f6d1b17599b05efa0fd426ad5fa7a6ec216650"
+    },
+    "real_world_tasks.pdf": {
+      "source": "figures/task.pdf",
+      "sha256": "c8960b27d2ae71854779839a579245b041ad0db2b48b4f3c9d8cfced46c3a5a3"
+    },
+    "astribot_success.png": {
+      "source": "figures/real_world_cases/astribot_success.png",
+      "sha256": "8beb3b964d8edf76419fde3cfa7493212deb97306d0a8b93696ed1f62a4d5014"
+    },
+    "agilex_success.png": {
+      "source": "figures/real_world_cases/agilex_success.png",
+      "sha256": "4a6b3b01a6977faad3bcf42fc958d40f1488a6dbc3997ae9ffee7f3c719210ab"
+    },
+    "astribot_failure.png": {
+      "source": "figures/real_world_cases/astribot_failure.png",
+      "sha256": "3b3b71d4c5208332798ae62856cd9c3c4385f4d6b5026fec35b15ef67920e368"
+    },
+    "agilex_failure.png": {
+      "source": "figures/real_world_cases/agilex_failure.png",
+      "sha256": "cde69f5a89cfdaa880ffb7ed3d9d8b54d506fd21f1e1b88066f6d83e1b8b174c"
+    },
+    "architecture.png": {
+      "rendered_from": "architecture.pdf",
+      "rendering": "pdftoppm -scale-to 1800 -singlefile -png",
+      "sha256": "2356694db8dfb45de4e6ad5083f3316fc255e62b66e2dfeb7133bb312a701257"
+    },
+    "geometry_memory_case.png": {
+      "rendered_from": "geometry_memory_case.pdf",
+      "rendering": "pdftoppm -scale-to 1800 -singlefile -png",
+      "sha256": "b58603dd3a09b1e4c174f14b086207d69e7672e08d268c0444865f9adececea4"
+    },
+    "real_world_tasks.png": {
+      "rendered_from": "real_world_tasks.pdf",
+      "rendering": "pdftoppm -scale-to 1800 -singlefile -png",
+      "sha256": "c4ed9b200173d7b966ffddad5ee53b03219d837a86232227b26dbfa8ee13e2d1"
+    }
+  }
+}

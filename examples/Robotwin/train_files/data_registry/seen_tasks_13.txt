@@ -1,0 +1,13 @@
+grab_roller
+handover_block
+lift_pot
+move_can_pot
+open_laptop
+pick_dual_bottles
+place_object_basket
+place_dual_shoes
+place_phone_stand
+put_bottles_dustbin
+put_object_cabinet
+stack_blocks_two
+stack_bowls_two
