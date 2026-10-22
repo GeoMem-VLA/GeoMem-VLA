@@ -4,7 +4,7 @@
 
 **Internalizing 3D Scene Understanding into Temporal Memory for Vision-Language-Action Models**
 
-[Hugging Face](https://huggingface.co/rxc205/GEOMEM-VLA) · [Overview](#overview) · [Results](#results) · [Case Studies](#case-studies) · [Installation](#installation) · [Quick Start](#quick-start)
+ [Paper](https://arxiv.org/pdf/2610.29866) · [Hugging Face](https://huggingface.co/rxc205/GEOMEM-VLA) · [Project page](https://geomem-vla.github.io/) · [Installation](#installation) · [Quick Start](#quick-start)
 
 </div>
 
