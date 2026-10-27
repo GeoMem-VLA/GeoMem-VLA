@@ -1,11 +1,10 @@
 """GeoPlan-Forcing modules for starVLA (3D geometry + planning auxiliary, train-only).
 
-Ported/adapted from the MemoryVLA implementation. Designed to attach to a Qwen3-VL backbone via
-the QwenGeoGR00T framework:
+Designed to attach to a Qwen3-VL backbone via the QwenGeoGR00T framework:
   - VGGTGeoTeacher       : frozen VGGT teacher producing 3D point-map targets (online).
   - GeoFlowHead          : self-contained flow-matching head that reconstructs the targets from
                            the geo condition tokens (no external diffusion dependency).
-  - GatedGeoFusion       : MemoryVLA++-style gated fusion of geo guidance into perceptual tokens.
+  - GatedGeoFusion       : gated fusion of geo guidance into the visual observation tokens.
   - GeoPlanQueryResampler: optional perceiver bridge (read-only) if not using in-sequence tokens.
 """
 

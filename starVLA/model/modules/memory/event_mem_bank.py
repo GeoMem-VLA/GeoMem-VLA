@@ -1,11 +1,11 @@
 """Event-guided (surprise-gated) episodic memory bank.
 
-This is an ADDITIVE variant of :class:`~starVLA.model.modules.memory.mem_bank.CogMemBank`. The
-original bank is left untouched so already-validated checkpoints keep reproducing exactly; pick this
-one explicitly via ``framework.geoplan.mem_bank_type = "event_guided"``.
+This is an ADDITIVE variant of :class:`~starVLA.model.modules.memory.mem_bank.EpisodeMemoryBank`. The
+similarity-consolidated bank is left untouched so already-validated checkpoints keep reproducing
+exactly; pick this one explicitly via ``framework.geoplan.mem_bank_type = "event_guided"``.
 
-What the original bank does
----------------------------
+What the similarity-consolidated bank does
+------------------------------------------
 Every frame is written into the episode bank, and a single gate decides *how much of the retrieved
 history* is blended into the current frame. The gate therefore only controls memory READS.
 
@@ -26,11 +26,7 @@ What this bank adds
 
 Where the gradients come from (important, and a real constraint)
 -----------------------------------------------------------------
-The write decision is a threshold on ``g_t`` -- discrete, hence non-differentiable, and stored
-features are detached (inherited from MemoryVLA to avoid cross-frame graphs). A gate that ONLY
-gated writes would therefore receive no gradient at all and never learn.
-
-The two gates therefore use two different differentiable paths. ``g_write`` is stored as a live
+The two gates use two different differentiable paths. ``g_write`` is stored as a live
 importance tensor and biases retrieval by later frames in the *same* forward call; ``g_read``
 modulates fusion on the current frame. At the end of the call, stored importance values are detached
 so stream-mode training cannot accidentally backpropagate through a graph from an earlier optimizer
@@ -39,17 +35,8 @@ trusted more.
 
 If the dataloader can provide an online keyframe signal, ``last_scores['g_write']`` retains the
 learned prediction while ``last_scores['g_write_effective']`` records the external value that
-actually controlled writes. Offline labels can instead be kept out of ``process_batch`` and used by
+actually controlled writes. Offline labels can instead be kept out of ``retrieve_and_write`` and used by
 the framework for supervision only.
-
-Consolidation, and the training/inference mismatch it inherits
---------------------------------------------------------------
-In the original bank ``mem_length == group_size`` (16/16), so during group-mode training the bank
-never exceeds its capacity, ``len(bank) > mem_length`` is never true, and the ToMe merge branch is
-*never executed in training* -- while at streaming inference it fires on nearly every frame of a long
-episode. Event-gated writing changes that capacity calculation: size ``mem_length`` from the expected
-events per episode, and preferably avoid overflow on both sides. ``__init__`` warns about unusually
-small group-mode capacities.
 """
 
 from __future__ import annotations
@@ -62,15 +49,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .mem_bank import CogMemBank
+from .mem_bank import EpisodeMemoryBank
 
 logger = logging.getLogger(__name__)
 
 
-class BiasedCrossTransformerBlock(nn.Module):
+class BiasedHistoryAttentionBlock(nn.Module):
     """Cross-attention + FFN block accepting an additive bias over the memory slots.
 
-    Mirrors :class:`~starVLA.model.modules.memory.mem_bank.CrossTransformerBlock` exactly except for
+    Mirrors :class:`~starVLA.model.modules.memory.mem_bank.HistoryAttentionBlock` exactly except for
     ``attn_bias``, which lets the caller steer attention towards high-importance slots.
     """
 
@@ -123,7 +110,7 @@ class EventScorer(nn.Module):
 
     They share the trunk (scene/event scores and the pooled summaries) and only split at the last
     layer, whose biases are initialised so that at step 0 this bank stays close to the original
-    :class:`CogMemBank`: ``g_write ~ 0.75`` (write every frame) and ``g_read ~ 0.0025`` (only a tiny
+    :class:`EpisodeMemoryBank`: ``g_write ~ 0.75`` (write every frame) and ``g_read ~ 0.0025`` (only a tiny
     fusion perturbation). It is not mathematically identical because a finite sigmoid cannot produce
     exactly zero and the learned importance values are only approximately equal.
     """
@@ -273,10 +260,10 @@ class EventScorer(nn.Module):
         return s_scene, s_event, g_write, g_read, w_logit
 
 
-class EventGuidedMemBank(CogMemBank):
+class EventMemoryBank(EpisodeMemoryBank):
     """Episodic memory that stores *events* rather than every frame.
 
-    Extra arguments on top of :class:`CogMemBank`:
+    Extra arguments on top of :class:`EpisodeMemoryBank`:
       write_threshold   gate value above which a frame is committed to the bank.
       min_write_stride  anti-starvation fallback: force a commit once this many ENVIRONMENT STEPS
                         passed without one. 0 disables it (the default).
@@ -352,13 +339,13 @@ class EventGuidedMemBank(CogMemBank):
         # Retrieval blocks that understand the importance bias. Copy the already-initialized parent
         # weights before replacing the modules, so merely opting into the event variant does not
         # silently redraw the whole retrieval stack.
-        parent_retrieval_blocks = self.retrieval_blocks
-        biased_retrieval_blocks = nn.ModuleList(
-            [BiasedCrossTransformerBlock(self.token_size) for _ in range(self.retrieval_layers)]
+        parent_history_attn = self.history_attn
+        biased_history_attn = nn.ModuleList(
+            [BiasedHistoryAttentionBlock(self.token_size) for _ in range(self.retrieval_layers)]
         )
-        for biased, parent in zip(biased_retrieval_blocks, parent_retrieval_blocks):
+        for biased, parent in zip(biased_history_attn, parent_history_attn):
             biased.load_state_dict(parent.state_dict())
-        self.retrieval_blocks = biased_retrieval_blocks
+        self.history_attn = biased_history_attn
         self.event_scorer = EventScorer(
             self.token_size,
             aux_dim=self.aux_dim,
@@ -373,7 +360,7 @@ class EventGuidedMemBank(CogMemBank):
 
         if self.min_write_stride > 0:
             logger.warning(
-                "EventGuidedMemBank: min_write_stride=%d is measured in ENVIRONMENT STEPS. Frames "
+                "EventMemoryBank: min_write_stride=%d is measured in ENVIRONMENT STEPS. Frames "
                 "reaching this bank are typically %s steps apart (exec_horizon at inference, "
                 "trajectory/group_size in training), so any value below that forces a write on every "
                 "frame and disables both the write gate and any external keyframe prior. Use 0, or a "
@@ -381,7 +368,7 @@ class EventGuidedMemBank(CogMemBank):
                 self.min_write_stride, "8-17",
             )
         if self.dataloader_type == "group" and self.mem_length < self.group_size:
-            # Deliberately the opposite advice from a plain CogMemBank. There, capacity had to stay
+            # Deliberately the opposite advice from a plain EpisodeMemoryBank. There, capacity had to stay
             # below group_size so the merge path was exercised in training instead of firing only at
             # inference. Here the write gate already keeps the bank sparse (a handful of events per
             # episode), so a capacity that a whole group can overflow
@@ -389,7 +376,7 @@ class EventGuidedMemBank(CogMemBank):
             # rollout never does. Size capacity ABOVE the expected number of events per episode and
             # the consolidation path simply never runs on either side.
             logger.warning(
-                "EventGuidedMemBank: mem_length=%d < group_size=%d. With event-gated writing the "
+                "EventMemoryBank: mem_length=%d < group_size=%d. With event-gated writing the "
                 "bank normally holds only a few slots per episode, so a capacity this small will "
                 "overflow during training but not during a gated rollout. Prefer mem_length >= the "
                 "expected events per episode (the current LIBERO 4-suite labeler measures ~3-6).",
@@ -478,7 +465,7 @@ class EventGuidedMemBank(CogMemBank):
             self.bank[eid] = [(t, f, importance.detach()) for (t, f, importance) in entries]
 
     # -------------------------------------------------------------- main entry
-    def process_batch(
+    def retrieve_and_write(
         self,
         tokens: torch.Tensor,            # [B, N, D]
         episode_ids: np.ndarray,
@@ -548,7 +535,7 @@ class EventGuidedMemBank(CogMemBank):
 
         # Pull the external prior to host memory once. The write decision needs a python bool, so
         # reading it per frame would cost one GPU->CPU sync per frame per bank (~48 per step for
-        # cog+per+geo at B=16); hoisting it removes them all on the supervised path.
+        # obs1+obs2+geo at B=16); hoisting it removes them all on the supervised path.
         prior_host = event_prior.detach().float().cpu().tolist() if event_prior is not None else None
 
         for i in range(B):
@@ -561,7 +548,7 @@ class EventGuidedMemBank(CogMemBank):
                     self.clear_episode(episode_ids[i - 1])
                     self.eid_stream = episode_ids[i]
 
-            working_mem = tokens[i].unsqueeze(0)  # (1, N, D)
+            cur_tokens = tokens[i].unsqueeze(0)  # (1, N, D)
             hist = self.bank.get(eid, [])
             if self.causal_retrieval and timesteps is not None and len(hist) > 0:
                 ti = int(timesteps[i])
@@ -570,35 +557,35 @@ class EventGuidedMemBank(CogMemBank):
             # ---- 1) retrieval, biased towards important slots
             if len(hist) > 0:
                 hist_feats = [f for (_, f, _) in hist]
-                episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)
+                hist_tokens = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)
                 if self.use_timestep_pe:
-                    hist_ts = torch.tensor([t for (t, _, _) in hist]).to(working_mem.device)
-                    pe = self.timestep_encoder(hist_ts).unsqueeze(0).repeat_interleave(N, dim=1)
+                    hist_ts = torch.tensor([t for (t, _, _) in hist]).to(cur_tokens.device)
+                    pe = self.time_encoder(hist_ts).unsqueeze(0).repeat_interleave(N, dim=1)
                 else:
-                    pe = torch.zeros_like(episode_mem)
+                    pe = torch.zeros_like(hist_tokens)
 
                 if self.importance_bias > 0.0:
                     # Differentiable for slots written earlier in this same forward pass -- this is
                     # the only gradient path into the write head (see `_commit`).
                     w = torch.stack(
-                        [x[2].to(working_mem.device).reshape(()) for x in hist]
+                        [x[2].to(cur_tokens.device).reshape(()) for x in hist]
                     ).clamp_min(1e-4)
                     # additive logit bias, broadcast over queries and repeated per token slot
                     bias = (self.importance_bias * torch.log(w)).repeat_interleave(N).view(1, 1, -1)
                 else:
                     bias = None
 
-                query = working_mem
-                for block in self.retrieval_blocks:
-                    query = block(query, episode_mem + pe, episode_mem, attn_bias=bias)
+                query = cur_tokens
+                for block in self.history_attn:
+                    query = block(query, hist_tokens + pe, hist_tokens, attn_bias=bias)
                 retrieved = query
-                mem_pool = episode_mem.mean(dim=(0, 1))
+                mem_pool = hist_tokens.mean(dim=(0, 1))
             else:
-                retrieved = working_mem
+                retrieved = cur_tokens
                 mem_pool = None
 
             # ---- 2) event scoring
-            cur_pool = working_mem.mean(dim=(0, 1))
+            cur_pool = cur_tokens.mean(dim=(0, 1))
             # Cross-attention returns query + attended history, not a standalone prediction of the
             # current frame. Compare pooled current/history features directly and use the magnitude
             # so opposite token changes cannot cancel each other.
@@ -619,12 +606,12 @@ class EventGuidedMemBank(CogMemBank):
 
             # ---- 3) fusion; read-surprise down-weights memory and carries the scorer's gradient
             if self.fusion_type == "add":
-                fused = (working_mem + retrieved) * 0.5
+                fused = (cur_tokens + retrieved) * 0.5
             else:
-                fused = self.gate_fusion_blocks(working_mem, retrieved)
+                fused = self.history_gate(cur_tokens, retrieved)
             if self.read_modulation and len(hist) > 0:
                 # g_read -> 1 means history poorly matches this frame: trust the observation.
-                fused = g_read * working_mem.to(fused.dtype) + (1.0 - g_read) * fused
+                fused = g_read * cur_tokens.to(fused.dtype) + (1.0 - g_read) * fused
             outputs.append(fused)
 
             # ---- 4) write only the frames worth remembering
@@ -671,7 +658,3 @@ class EventGuidedMemBank(CogMemBank):
         result = torch.cat(outputs, dim=0)
         self._detach_stored_importance()
         return result
-
-
-class EventGuidedPerMemBank(EventGuidedMemBank):
-    """Perceptual counterpart of :class:`EventGuidedMemBank` (identical mechanism, separate weights)."""

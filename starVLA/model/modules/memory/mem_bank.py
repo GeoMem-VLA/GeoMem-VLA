@@ -1,21 +1,23 @@
-"""Perception / Cognition / Geo memory banks ported from MemoryVLA into starVLA.
+"""Episode memory banks (observation and geometric streams) for GeoMem-VLA.
 
-These modules implement the MemoryVLA "perception-cognition memory bank": a per-episode working
-memory that retrieves cross-frame history via cross-attention, fuses it into the current frame with
-a learnable gate, and consolidates the episode memory with ToMe / FIFO compaction.
+``EpisodeMemoryBank`` keeps a bounded, per-episode history for ONE token stream. It retrieves
+earlier entries of the same episode via cross-attention (queries = current tokens, keys/values =
+stored tokens plus learned timestamp encodings), fuses the retrieved context with the current tokens
+through a learnable gate, and consolidates the bank by merging the most similar temporally adjacent
+entries (ToMe) or by FIFO eviction. The framework instantiates one bank per stream: two observation
+streams (visual tokens, final VLM state token) and one geometric stream (GeoPlan tokens).
 
-Differences vs. the original MemoryVLA implementation:
+Design notes:
   - Everything is ``token_size``-agnostic; the caller passes the working dimension at runtime
     (Qwen3-VL-4B hidden size = 2560, geo work dim = 512, etc.). Nothing is hardcoded.
-  - The vision compressor (BottleneckSE over DINO+SigLIP) is intentionally NOT ported: in starVLA
-    the perceptual tokens are the Qwen3-VL vision hidden states (already at the backbone hidden dim),
-    so no separate compressor is needed.
+  - No separate vision compressor is used: in starVLA the visual observation tokens are the Qwen3-VL
+    vision hidden states (already at the backbone hidden dim).
 
 Memory state lives in ``self.bank`` (a python dict keyed by episode id). For ``dataloader_type
 == "group"`` the bank is cleared at the start of every batch, which makes this safe to use even when
 the dataloader samples frames randomly (no cross-batch state leak): when no same-episode history is
-present, retrieval falls back to the working memory and -- because both gate inputs are then equal --
-the fusion output equals the working memory exactly (a genuine identity in that degenerate case).
+present, retrieval falls back to the current tokens and -- because both gate inputs are then equal --
+the fusion output equals the current tokens exactly (a genuine identity in that degenerate case).
 
 Distributed / DeepSpeed notes:
   - ``self.bank`` is plain per-rank python state (detached GPU tensors), NOT registered parameters or
@@ -23,14 +25,13 @@ Distributed / DeepSpeed notes:
     ranks. This is correct for data-parallel training: each rank keeps the memory for its own local
     micro-batch. With ``dataloader_type="group"`` the bank is cleared every batch, so its footprint
     is bounded by ``mem_length`` and nothing leaks across steps.
-  - Stored history is detached, so retrieval never keeps the cross-frame autograd graph (matching the
-    original MemoryVLA behaviour). HOWEVER, ``process_batch`` also MUTATES ``self.bank``; if the
+  - Stored history is detached, so retrieval never keeps the cross-frame autograd graph. HOWEVER, ``retrieve_and_write`` also MUTATES ``self.bank``; if the
     region that calls it were re-run by gradient checkpointing, a frame could be written into memory
     twice. Keep the memory banks OUTSIDE any gradient-checkpoint recompute region (the Qwen backbone
     checkpointing does not re-run these external modules), or pass ``update_state=False`` on recompute.
 
 Causality:
-  - ``process_batch`` consolidates each sample into the bank AFTER producing its output, so within a
+  - ``retrieve_and_write`` consolidates each sample into the bank AFTER producing its output, so within a
     batch sample ``i`` can only retrieve samples ``0..i-1``. For this to be temporally causal the
     dataloader MUST present same-episode frames in increasing-time order. As a hard guard,
     ``causal_retrieval=True`` additionally drops any history entry whose stored timestep is not
@@ -39,7 +40,7 @@ Causality:
 
 State lifecycle (explicit, NOT tied to train()/eval()):
   - The caller controls clearing/writing via ``reset_before_batch`` and ``update_state`` on
-    ``process_batch`` (plus ``reset()`` / ``clear_episode(eid)``). Group-mode training passes
+    ``retrieve_and_write`` (plus ``reset()`` / ``clear_episode(eid)``). Group-mode training passes
     ``reset_before_batch=True``; streaming inference resets at episode boundaries instead.
 
 Stream-mode limitation:
@@ -61,7 +62,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TimestepEmbedder(nn.Module):
+class TimeStampEncoder(nn.Module):
     """Embeds scalar timesteps into vector representations (sinusoidal + MLP)."""
 
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
@@ -91,7 +92,7 @@ class TimestepEmbedder(nn.Module):
         return self.mlp(t_freq)
 
 
-class CrossTransformerBlock(nn.Module):
+class HistoryAttentionBlock(nn.Module):
     """Single cross-attention + FFN block (pre-projected q/k/v, post-LN residual)."""
 
     def __init__(self, feature_dim: int) -> None:
@@ -117,13 +118,13 @@ class CrossTransformerBlock(nn.Module):
         return self.ffn_norm(x + ffn_out)
 
 
-class GateFusion(nn.Module):
-    """Learnable gate that blends working memory with retrieved episode memory.
+class HistoryGate(nn.Module):
+    """Learnable gate that blends the current tokens with the retrieved episode history.
 
     NOTE on initialization: with proj weight/bias ~ 0, ``sigmoid(proj(...)) ~ 0.5`` at the start of
-    training, so the output is ~ ``0.5 * working + 0.5 * retrieved`` -- a BALANCED AVERAGE, not an
+    training, so the output is ~ ``0.5 * current + 0.5 * retrieved`` -- a BALANCED AVERAGE, not an
     identity. (It only becomes an exact identity in the degenerate case where the two inputs are
-    equal, e.g. when there is no retrieved history.) This is the original MemoryVLA initialization.
+    equal, e.g. when there is no retrieved history.)
     """
 
     def __init__(self, dim: int) -> None:
@@ -143,15 +144,15 @@ class GateFusion(nn.Module):
         return scale * x1 + (1 - scale) * x2
 
 
-class CogMemBank(nn.Module):
-    """Cognition memory bank: per-episode working memory with cross-frame retrieval + consolidation.
+class EpisodeMemoryBank(nn.Module):
+    """Per-episode memory bank for one token stream: causal retrieval, gated fusion, consolidation.
 
     The bank is dimension-agnostic: ``token_size`` is the working dim of the tokens it operates on
-    (e.g. the backbone hidden size for the cognition bank, or the geo work dim for the geo bank).
+    (e.g. the backbone hidden size for the observation banks, or the geo work dim for the geo bank).
 
-    IMPORTANT: ``process_batch`` stacks per-frame features across an episode, so every frame fed for
-    a given episode must have the SAME number of tokens ``N``. Cognition (N=1) and geo (N=K) tokens
-    are already length-stable; perceptual tokens from a backbone with a DYNAMIC vision-token count
+    IMPORTANT: ``retrieve_and_write`` stacks per-frame features across an episode, so every frame fed for
+    a given episode must have the SAME number of tokens ``N``. The state token (N=1) and geo (N=K) tokens
+    are already length-stable; visual tokens from a backbone with a DYNAMIC vision-token count
     (e.g. Qwen3-VL) MUST be length-normalized to a fixed N (e.g. via a Perceiver resampler) BEFORE
     being passed here, otherwise the cross-frame stacking will raise a shape error.
     """
@@ -199,19 +200,19 @@ class CogMemBank(nn.Module):
         self.causal_retrieval = causal_retrieval
         self.validate_group_layout = validate_group_layout
 
-        self.retrieval_blocks = nn.ModuleList(
-            [CrossTransformerBlock(self.token_size) for _ in range(self.retrieval_layers)]
+        self.history_attn = nn.ModuleList(
+            [HistoryAttentionBlock(self.token_size) for _ in range(self.retrieval_layers)]
         )
 
         if self.fusion_type == "gate":
-            self.gate_fusion_blocks = GateFusion(self.token_size)
+            self.history_gate = HistoryGate(self.token_size)
 
         if self.use_timestep_pe:
-            self.timestep_encoder = TimestepEmbedder(
+            self.time_encoder = TimeStampEncoder(
                 self.token_size, frequency_embedding_size=max(8, self.token_size // 4)
             )
         else:
-            self.timestep_encoder = None
+            self.time_encoder = None
 
         self.reset()
 
@@ -224,7 +225,7 @@ class CogMemBank(nn.Module):
         self.bank.pop(episode_id, None)
 
     @torch.no_grad()
-    def _consolidate_with_token_merge(self, episode_id) -> None:
+    def _merge_closest_pair(self, episode_id) -> None:
         bank = self.bank.get(episode_id, [])
         T = len(bank)
         if T < 2:
@@ -250,7 +251,7 @@ class CogMemBank(nn.Module):
         bank.pop(idx_max + 1)
 
     @torch.no_grad()
-    def _memory_consolidate(self, episode_id, feat: torch.Tensor, timestep) -> None:
+    def _append_and_compact(self, episode_id, feat: torch.Tensor, timestep) -> None:
         if episode_id not in self.bank:
             self.bank[episode_id] = []
         self.bank[episode_id].append((timestep, feat.detach().clone()))
@@ -258,7 +259,7 @@ class CogMemBank(nn.Module):
             if self.consolidate_type == "fifo":
                 self.bank[episode_id] = self.bank[episode_id][-self.mem_length :]
             elif self.consolidate_type == "tome":
-                self._consolidate_with_token_merge(episode_id)
+                self._merge_closest_pair(episode_id)
             else:
                 raise NotImplementedError
 
@@ -279,7 +280,7 @@ class CogMemBank(nn.Module):
                         f"Group [{start}:{end}] is not strictly time-ordered: {group_ts.tolist()}"
                     )
 
-    def process_batch(
+    def retrieve_and_write(
         self,
         tokens: torch.Tensor,        # [B, N, D]
         episode_ids: np.ndarray,
@@ -326,7 +327,7 @@ class CogMemBank(nn.Module):
         outputs = []
 
         # Single dtype chokepoint: align incoming tokens to the bank's parameter
-        # dtype (bf16 under DeepSpeed) so working memory, stored history, retrieval
+        # dtype (bf16 under DeepSpeed) so current tokens, stored history, retrieval
         # and fusion all stay on one dtype.
         try:
             param_dtype = next(self.parameters()).dtype
@@ -356,7 +357,7 @@ class CogMemBank(nn.Module):
                     self.eid_stream = episode_ids[i]
 
             # 1) memory retrieval
-            working_mem = tokens[i].unsqueeze(0)  # (1, N, D)
+            cur_tokens = tokens[i].unsqueeze(0)  # (1, N, D)
             hist = self.bank.get(eid, [])
             # Causal guard (independent of use_timestep_pe): only retrieve strictly-earlier frames.
             # No-op when the dataloader already orders same-episode frames by increasing time.
@@ -386,25 +387,25 @@ class CogMemBank(nn.Module):
             })
             if len(hist) > 0:
                 hist_feats = [feat for _, feat in hist]
-                episode_mem = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)  # (1, T*N, D)
+                hist_tokens = torch.stack(hist_feats, dim=0).reshape(-1, D).unsqueeze(0)  # (1, T*N, D)
                 if self.use_timestep_pe:
-                    hist_timesteps = torch.tensor([t for t, _ in hist]).to(working_mem.device)
-                    pe = self.timestep_encoder(hist_timesteps).unsqueeze(0)  # (1, T, D)
+                    hist_timesteps = torch.tensor([t for t, _ in hist]).to(cur_tokens.device)
+                    pe = self.time_encoder(hist_timesteps).unsqueeze(0)  # (1, T, D)
                     pe = pe.repeat_interleave(N, dim=1)  # (1, T*N, D)
                 else:
-                    pe = torch.zeros_like(episode_mem)
-                query = working_mem
-                for block in self.retrieval_blocks:
-                    query = block(query, episode_mem + pe, episode_mem)
-                retrieved_episode_mem = query
+                    pe = torch.zeros_like(hist_tokens)
+                query = cur_tokens
+                for block in self.history_attn:
+                    query = block(query, hist_tokens + pe, hist_tokens)
+                retrieved = query
             else:
-                retrieved_episode_mem = working_mem  # (1, N, D)
+                retrieved = cur_tokens  # (1, N, D)
 
             # 2) adaptive fusion
             if self.fusion_type == "add":
-                fused_feats = (working_mem + retrieved_episode_mem) * 0.5
+                fused_feats = (cur_tokens + retrieved) * 0.5
             else:  # gate
-                fused_feats = self.gate_fusion_blocks(working_mem, retrieved_episode_mem)
+                fused_feats = self.history_gate(cur_tokens, retrieved)
 
             outputs.append(fused_feats)
 
@@ -412,40 +413,8 @@ class CogMemBank(nn.Module):
             if update_state:
                 timestep_i = timesteps[i] if timesteps is not None else None
                 if self.update_fused:
-                    self._memory_consolidate(eid, fused_feats.squeeze(0), timestep_i)
+                    self._append_and_compact(eid, fused_feats.squeeze(0), timestep_i)
                 else:
-                    self._memory_consolidate(eid, tokens[i], timestep_i)
+                    self._append_and_compact(eid, tokens[i], timestep_i)
 
         return torch.cat(outputs, dim=0)  # [B, N, D]
-
-
-class PerMemBank(CogMemBank):
-    """Perception memory bank: identical mechanism to ``CogMemBank`` (semantic distinction only)."""
-
-    def __init__(
-        self,
-        dataloader_type: str,
-        group_size: int,
-        token_size: int,
-        mem_length: int = 16,
-        retrieval_layers: int = 2,
-        use_timestep_pe: bool = True,
-        fusion_type: str = "gate",
-        consolidate_type: str = "tome",
-        update_fused: bool = False,
-        causal_retrieval: bool = True,
-        validate_group_layout: bool = False,
-    ) -> None:
-        super().__init__(
-            dataloader_type=dataloader_type,
-            group_size=group_size,
-            token_size=token_size,
-            mem_length=mem_length,
-            retrieval_layers=retrieval_layers,
-            use_timestep_pe=use_timestep_pe,
-            fusion_type=fusion_type,
-            consolidate_type=consolidate_type,
-            update_fused=update_fused,
-            causal_retrieval=causal_retrieval,
-            validate_group_layout=validate_group_layout,
-        )

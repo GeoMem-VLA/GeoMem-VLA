@@ -4,7 +4,7 @@
 
 A STANDALONE fork of ``QwenGeoGR00T.py`` frozen for RoboTwin (dual-arm, absolute joint qpos).
 The base pipeline is identical to the parent (Qwen3-VL backbone -> GeoPlan inseq-token bridge ->
-cog/per/geo memory banks -> gated geo fusion -> GR00T flow-matching action head; VGGT-supervised
+obs2/obs1/geo memory banks -> gated geo fusion -> GR00T flow-matching action head; VGGT-supervised
 GeoFlow aux head, train-only) — see QwenGeoGR00T.py for the full pipeline documentation.
 The parent file is NOT imported and NOT modified; experiments on either framework cannot break
 the other. Only the deltas below differ, and they are ALL config-defaults (no env vars).
@@ -68,7 +68,8 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingActionHead
 from starVLA.model.modules.geoplan import GatedGeoFusion, GeoFlowHead, GeoInseqBridge, GeoPlanQueryResampler, VGGTGeoTeacher
-from starVLA.model.modules.memory import CogMemBank, EventGuidedMemBank, EventGuidedPerMemBank, PerMemBank
+from starVLA.model.modules.memory import EpisodeMemoryBank, EventMemoryBank
+from starVLA.model.modules.memory.legacy_compat import legacy_state_dict_pre_hook, remap_legacy_geoplan_cfg
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils import initialize_overwatch
@@ -225,11 +226,11 @@ class QwenGeoGR00TRoboTwinDefaultConfig:
             # --- master switches ---
             "use_geoplan": True,          # run the GeoPlan bridge + (if teacher available) aux loss
             "use_geo_aux": True,          # build/train the GeoFlowHead (only if a VGGT ckpt is set)
-            "use_memory": True,           # run cog/per/geo memory banks
+            "use_memory": True,           # run obs2/obs1/geo memory banks
             "geo_bridge_type": "inseq_token",  # "inseq_token" (OFT-style) | "perceiver"
             # action-head cross-attention context:
-            #   "compressed"       -> [cog | per]                  (MemoryVLA-style; DEFAULT)
-            #   "full_plus_memory" -> [full last_hidden | cog | per]
+            #   "compressed"       -> [obs2 | obs1]                  (DEFAULT)
+            #   "full_plus_memory" -> [full last_hidden | obs2 | obs1]
             #   "full"             -> [full last_hidden]            (== base QwenGR00T, no memory)
             "action_context_type": "compressed",
             # which geo_cond the GeoFlow aux loss supervises: "raw" | "memory" | "both"
@@ -250,9 +251,9 @@ class QwenGeoGR00TRoboTwinDefaultConfig:
             # Reject per-sample scale estimates outside [1/geo_eef_scale_clip, geo_eef_scale_clip]
             # around the batch median scale (guards against degenerate anchors).
             "geo_eef_scale_clip": 4.0,
-            # --- perceptual token-count normalization ---
-            "per_num_tokens": 64,         # M perceptual tokens after resampling
-            "per_resampler_layers": 2,
+            # --- visual-token count normalization (obs1) ---
+            "obs1_num_tokens": 64,         # M visual tokens after resampling
+            "obs1_resampler_layers": 2,
             # --- bridge ---
             "geo_num_queries": 16,        # K GeoPlan tokens
             "geo_work_dim": 512,          # geo conditioning work dim
@@ -288,8 +289,8 @@ class QwenGeoGR00TRoboTwinDefaultConfig:
             # keeps memory across steps (eval harness must reset at episode boundaries).
             # Config-only: this framework has NO env-var override.
             "eval_memory_mode": "stateless",
-            # Opt-in event-guided memory. The default remains the validated MemoryVLA-style bank.
-            "mem_bank_type": "cog",
+            # Opt-in event-guided memory. The default remains the validated bank.
+            "mem_bank_type": "similarity",
             "event_write_threshold": 0.5,
             # Measured in ENVIRONMENT STEPS, not frames seen by the bank. Frames arrive far apart
             # (exec_horizon at inference, trajectory/group_size in training), so a small value fires
@@ -340,6 +341,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         # ---- GeoPlan / memory config (defaults merged with YAML overrides) ----
         default_geo = QwenGeoGR00TRoboTwinDefaultConfig().geoplan
         user_geo = dict(self.config.framework.get("geoplan", {})) if self.config.framework.get("geoplan", None) else {}
+        remap_legacy_geoplan_cfg(user_geo)  # accept configs saved under the old stream names
         gcfg = {**default_geo, **user_geo}
         self.geo_cfg = gcfg
 
@@ -352,11 +354,11 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         self.geo_use_future = bool(gcfg["geo_use_future"])
         self.geo_flow_stride = int(gcfg["geo_flow_stride"])
         self.geo_loss_coeff = float(gcfg["geo_loss_coeff"])
-        self.per_num_tokens = int(gcfg["per_num_tokens"])
+        self.obs1_num_tokens = int(gcfg["obs1_num_tokens"])
         # Config-only (NO env-var override in this framework — one pipeline, one config).
         self.eval_memory_mode = str(gcfg.get("eval_memory_mode", "stateless"))
         self.mem_dataloader_type = str(gcfg["dataloader_type"])
-        self.mem_bank_type = str(gcfg.get("mem_bank_type", "cog")).strip().lower()
+        self.mem_bank_type = str(gcfg.get("mem_bank_type", "similarity")).strip().lower()
         self.event_aux_dim = int(gcfg.get("event_aux_dim", 0))
         self.event_aux_key = str(gcfg.get("event_aux_key", "event_aux"))
         self.event_prior_key = str(gcfg.get("event_prior_key", "event_prior"))
@@ -421,14 +423,14 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         self.geo_num_points = P
         self.geo_num_waypoints = W
 
-        # ---- perceptual token-count normalization (Qwen3-VL vision token count is DYNAMIC) ----
+        # ---- visual-token count normalization (obs1) (Qwen3-VL vision token count is DYNAMIC) ----
         # M learnable queries cross-attend the (variable-length) vision tokens -> fixed [B, M, H].
         # work_dim == H so there is no channel down-projection (in_proj is Identity); this only fixes
-        # the token LENGTH so the per memory bank's cross-frame stacking and vl_embs stay length-stable.
-        self.per_resampler = GeoPlanQueryResampler(
+        # the token LENGTH so the obs1 memory bank's cross-frame stacking and vl_embs stay length-stable.
+        self.obs1_resampler = GeoPlanQueryResampler(
             dim=H,
-            num_queries=self.per_num_tokens,
-            num_layers=int(gcfg["per_resampler_layers"]),
+            num_queries=self.obs1_num_tokens,
+            num_layers=int(gcfg["obs1_resampler_layers"]),
             work_dim=H,
         )
 
@@ -455,8 +457,8 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
             else:
                 raise ValueError(f"Unknown geo_bridge_type={self.geo_bridge_type}")
 
-            # ---- non-destructive gated fusion of geo guidance into perceptual tokens ----
-            self.geo_fusion = GatedGeoFusion(per_dim=H, geo_dim=self.geo_work_dim)
+            # ---- non-destructive gated fusion of geo guidance into the visual observation tokens (obs1) ----
+            self.geo_fusion = GatedGeoFusion(obs_dim=H, geo_dim=self.geo_work_dim)
             # ---- frozen VGGT teacher (held in a list -> NOT a registered submodule) ----
             # Treat None / empty string as "no teacher" (the aux 3D loss is then skipped).
             ckpt = gcfg["geo_vggt_ckpt"]
@@ -491,7 +493,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         else:
             self.use_geo_aux = False
 
-        # ---- perception / cognition / geo memory banks ----
+        # ---- observation / geometric episode memory banks ----
         if self.use_memory:
             # memfix default: mem_length == group_size (8/8), so the streaming-inference bank
             # capacity matches the training window and ToMe consolidation behaves identically at
@@ -509,9 +511,9 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
                 causal_retrieval=bool(gcfg.get("causal_retrieval", True)),
                 validate_group_layout=bool(gcfg.get("validate_group_layout", False)),
             )
-            if self.mem_bank_type not in {"cog", "event_guided"}:
+            if self.mem_bank_type not in {"similarity", "event_guided"}:
                 raise ValueError(
-                    f"Unknown mem_bank_type={self.mem_bank_type!r}; expected 'cog' or 'event_guided'"
+                    f"Unknown mem_bank_type={self.mem_bank_type!r}; expected 'similarity' or 'event_guided'"
                 )
             if self.mem_bank_type == "event_guided":
                 mem_kwargs.update(
@@ -530,7 +532,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
                         gcfg.get("event_scorer_stop_gradient", False)
                     ),
                 )
-                cog_cls, per_cls = EventGuidedMemBank, EventGuidedPerMemBank
+                bank_cls = EventMemoryBank
                 print(
                     "[QwenGeoGR00T_RoboTwin] mem_bank_type='event_guided' "
                     f"(mem_length={_mem_len}, "
@@ -538,13 +540,15 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
                     f"scorer_stop_gradient={mem_kwargs['scorer_stop_gradient']})"
                 )
             else:
-                cog_cls, per_cls = CogMemBank, PerMemBank
-            self.cog_mem_bank = cog_cls(token_size=H, **mem_kwargs)
-            self.per_mem_bank = per_cls(token_size=H, **mem_kwargs)
+                bank_cls = EpisodeMemoryBank
+            self.obs2_mem_bank = bank_cls(token_size=H, **mem_kwargs)
+            self.obs1_mem_bank = bank_cls(token_size=H, **mem_kwargs)
             if self.use_geoplan:
-                self.geo_mem_bank = cog_cls(token_size=self.geo_work_dim, **mem_kwargs)
+                self.geo_mem_bank = bank_cls(token_size=self.geo_work_dim, **mem_kwargs)
 
         self._last_geo_logs: Dict[str, torch.Tensor] = {}
+        # Checkpoints saved under the previous stream naming still load (keys are renamed on the fly).
+        self._register_load_state_dict_pre_hook(legacy_state_dict_pre_hook)
 
     # ------------------------------------------------------------------ helpers
     def _get_geo_teacher(self, device: torch.device) -> Optional[VGGTGeoTeacher]:
@@ -608,8 +612,8 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         return last_hidden.gather(dim=1, index=expanded)  # [B, k, H]
 
     @staticmethod
-    def _extract_cog(last_hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
-        """Cognition token = hidden at the last non-padding position -> [B, 1, H] (padding-side robust)."""
+    def _extract_state_token(last_hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """State token = final VLM hidden state at the last non-padding position -> [B, 1, H] (padding-side robust)."""
         if attention_mask is None:
             return last_hidden[:, -1:, :]
         H = last_hidden.shape[-1]
@@ -617,7 +621,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         return last_hidden.gather(1, last_idx[:, None, None].expand(-1, 1, H))
 
     def _encode_and_extract(self, batch_images, instructions):
-        """Run Qwen3-VL once and return (cog, per, geo_cond, full_hidden, attention_mask)."""
+        """Run Qwen3-VL once and return (obs2, obs1, geo_cond, full_hidden, attention_mask)."""
         if self.use_geoplan and self.geo_bridge_type == "inseq_token":
             suffix = " <geoplan>" + (self.geo_emoji * self.geo_num_queries) + "</geoplan>"
             instructions = [ins + suffix for ins in instructions]
@@ -630,30 +634,30 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         # autocast as the VLM so their fp32 master weights are cast for the matmul (no fp32 blow-up).
         vision_mask = (input_ids == self.image_token_id).to(dtype=torch.long)  # [B, L], 1 at vision tokens
         if int(vision_mask.sum().item()) == 0:
-            raise RuntimeError("[QwenGeoGR00T_RoboTwin] no image tokens found; cannot build perceptual tokens.")
+            raise RuntimeError("[QwenGeoGR00T_RoboTwin] no image tokens found; cannot build visual observation tokens.")
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.qwen_vl_interface(
                 **qwen_inputs, output_attentions=False, output_hidden_states=True, return_dict=True
             )
             last_hidden = outputs.hidden_states[-1]  # [B, L, H]
-            # per: token-count normalization. M queries attend ONLY the vision positions (mask=1),
+            # obs1: token-count normalization. M queries attend ONLY the vision positions (mask=1),
             # so a DYNAMIC #vision tokens (per frame / per sample) becomes a fixed [B, M, H].
-            per = self.per_resampler(last_hidden, attention_mask=vision_mask)  # [B, M, H]
+            obs1 = self.obs1_resampler(last_hidden, attention_mask=vision_mask)  # [B, M, H]
             geo_cond = None
             if self.use_geoplan and self.geo_bridge_type == "perceiver":
                 geo_cond = self.geo_resampler(last_hidden, attention_mask=attention_mask)  # [B, K, work_dim]
 
         # Cast the (small) extracted tensors to fp32 for the downstream side-modules. This keeps the
-        # cog/per/geo conditioning in full precision (bf16's 8-bit mantissa is coarse and can inject
+        # obs2/obs1/geo conditioning in full precision (bf16's 8-bit mantissa is coarse and can inject
         # noise into low-magnitude channels), and avoids bf16-input vs fp32-weight mismatches. The
         # side-modules self-align dtype where needed, and the action head runs in its own fp32
         # autocast downstream, so keeping these fp32 is the safe/stable choice now that OOM is
         # resolved via smaller batch / geo_vggt_img_size.
-        # cog: the cognition summary = hidden state at the LAST NON-PADDING position (robust to the
+        # obs2: the state token = hidden state at the LAST NON-PADDING position (robust to the
         # padding side via argmax-of-cumsum). Under Qwen's causal attention it has attended to the
-        # full multimodal context (the Qwen3-VL analogue of MemoryVLA's last-LLM-token cog).
-        cog = self._extract_cog(last_hidden, attention_mask).float()   # [B, 1, H]
-        per = per.float()                                               # [B, M, H]
+        # full multimodal context.
+        obs2 = self._extract_state_token(last_hidden, attention_mask).float()   # [B, 1, H]
+        obs1 = obs1.float()                                               # [B, M, H]
         if self.use_geoplan:
             if self.geo_bridge_type == "inseq_token":
                 # .float() BEFORE geo_inseq.project(): geo_hidden is bf16 (sliced from last_hidden,
@@ -666,7 +670,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
                 geo_cond = self.geo_inseq.project(geo_hidden).float()  # [B, K, work_dim]
             elif geo_cond is not None:  # perceiver
                 geo_cond = geo_cond.float()
-        return cog, per, geo_cond, last_hidden, attention_mask
+        return obs2, obs1, geo_cond, last_hidden, attention_mask
 
     @staticmethod
     def _param_dtype(module: torch.nn.Module, default: torch.dtype = torch.float32) -> torch.dtype:
@@ -718,7 +722,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
     def _event_supervision_loss(self, event_prior: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if event_prior is None or self.event_supervision_coeff <= 0:
             return None
-        banks = [self.cog_mem_bank, self.per_mem_bank]
+        banks = [self.obs2_mem_bank, self.obs1_mem_bank]
         if self.use_geoplan and hasattr(self, "geo_mem_bank"):
             banks.append(self.geo_mem_bank)
         losses = []
@@ -742,7 +746,7 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
     def _event_memory_logs(self) -> Dict[str, torch.Tensor]:
         if not (self.use_memory and self.mem_bank_type == "event_guided"):
             return {}
-        named_banks = [("cog", self.cog_mem_bank), ("per", self.per_mem_bank)]
+        named_banks = [("obs2", self.obs2_mem_bank), ("obs1", self.obs1_mem_bank)]
         if self.use_geoplan and hasattr(self, "geo_mem_bank"):
             named_banks.append(("geo", self.geo_mem_bank))
         logs = {}
@@ -757,8 +761,8 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
 
     def _apply_memory_and_fusion(
         self,
-        cog,
-        per,
+        obs2,
+        obs1,
         geo_cond,
         episode_ids,
         timesteps,
@@ -767,13 +771,13 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         event_aux=None,
         event_prior=None,
     ):
-        """Run the memory banks and the gated geo fusion; return the fused (cog, per).
+        """Run the memory banks and the gated geo fusion; return the fused (obs2, obs1).
 
         State lifecycle is controlled EXPLICITLY (not via train()/eval()): ``reset_before_batch``
         clears the banks first (group-mode training), ``update_state`` writes the current frames.
 
         Every sub-module input is aligned to that module's parameter dtype first: the fp32
-        conditioning (cog/per/geo_cond from `_encode_and_extract`) must match whatever dtype the
+        conditioning (obs2/obs1/geo_cond from `_encode_and_extract`) must match whatever dtype the
         side-modules ended up in (bf16 under DeepSpeed / `--use_bf16`, fp32 otherwise), so no
         bf16-input vs fp32-weight (or vice-versa) mismatch can ever raise.
         """
@@ -782,24 +786,24 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
             write_prior = event_prior if self.event_prior_controls_write else None
             mem_kw.update(aux=event_aux, event_prior=write_prior)
         if self.use_memory:
-            cog = cog.to(self._param_dtype(self.cog_mem_bank))
-            per = per.to(self._param_dtype(self.per_mem_bank))
-            cog = self.cog_mem_bank.process_batch(cog, episode_ids, timesteps, **mem_kw)
-            per = self.per_mem_bank.process_batch(per, episode_ids, timesteps, **mem_kw)
+            obs2 = obs2.to(self._param_dtype(self.obs2_mem_bank))
+            obs1 = obs1.to(self._param_dtype(self.obs1_mem_bank))
+            obs2 = self.obs2_mem_bank.retrieve_and_write(obs2, episode_ids, timesteps, **mem_kw)
+            obs1 = self.obs1_mem_bank.retrieve_and_write(obs1, episode_ids, timesteps, **mem_kw)
         # geo_guidance is the MEMORY-fused geo output; it is None when memory is off (so callers can
         # tell raw from memory-fused). Fusion still runs on raw geo_cond when there is no memory.
         geo_guidance = None
         if self.use_geoplan and geo_cond is not None:
             if self.use_memory:
                 geo_cond = geo_cond.to(self._param_dtype(self.geo_mem_bank))
-                geo_guidance = self.geo_mem_bank.process_batch(geo_cond, episode_ids, timesteps, **mem_kw)
+                geo_guidance = self.geo_mem_bank.retrieve_and_write(geo_cond, episode_ids, timesteps, **mem_kw)
             fusion_geo = geo_guidance if geo_guidance is not None else geo_cond
             # GatedGeoFusion runs raw Linear layers and does NOT self-align, so align both inputs.
             _fdt = self._param_dtype(self.geo_fusion)
-            per = per.to(_fdt)
+            obs1 = obs1.to(_fdt)
             fusion_geo = fusion_geo.to(_fdt)
-            per = self.geo_fusion(per, fusion_geo)
-        return cog, per, geo_guidance
+            obs1 = self.geo_fusion(obs1, fusion_geo)
+        return obs2, obs1, geo_guidance
 
     def _eef_world_to_vggt(
         self,
@@ -967,15 +971,15 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0  # [H, W, 3]
         return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
-    def _build_action_context(self, cog, per, full_hidden, attention_mask):
+    def _build_action_context(self, obs2, obs1, full_hidden, attention_mask):
         """Assemble the action-head cross-attention context + its key-padding/attention mask."""
-        B = cog.shape[0]
+        B = obs2.shape[0]
         if self.action_context_type == "compressed":
-            vl = torch.cat([cog, per], dim=1)
+            vl = torch.cat([obs2, obs1], dim=1)
             mask = torch.ones(vl.shape[:2], dtype=torch.bool, device=vl.device)
             return vl, mask
         # Keep full_hidden in its native dtype (bf16 under DeepSpeed) so that
-        # torch.cat([fh, cog, per]) does not hit a Float vs BFloat16 mismatch.
+        # torch.cat([fh, obs2, obs1]) does not hit a Float vs BFloat16 mismatch.
         # The action_model is wrapped by its own fp32 autocast context at the call site.
         fh = full_hidden
         if attention_mask is not None:
@@ -984,16 +988,16 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
             am = torch.ones(fh.shape[:2], dtype=torch.bool, device=fh.device)
         if self.action_context_type == "full":
             return fh, am
-        # full_plus_memory: [full last_hidden | cog | per]
-        total_len = fh.shape[1] + cog.shape[1] + per.shape[1]
+        # full_plus_memory: [full last_hidden | obs2 | obs1]
+        total_len = fh.shape[1] + obs2.shape[1] + obs1.shape[1]
         max_seq = int(self.config.framework.action_model.get("max_seq_len", 1024))
         if total_len > max_seq:
             raise ValueError(
                 f"action_context_type='full_plus_memory' produces {total_len} context tokens "
                 f"(> action_model.max_seq_len={max_seq}). Increase max_seq_len or use 'compressed'."
             )
-        extra = torch.ones(B, cog.shape[1] + per.shape[1], dtype=torch.bool, device=fh.device)
-        vl = torch.cat([fh, cog.to(fh.dtype), per.to(fh.dtype)], dim=1)
+        extra = torch.ones(B, obs2.shape[1] + obs1.shape[1], dtype=torch.bool, device=fh.device)
+        vl = torch.cat([fh, obs2.to(fh.dtype), obs1.to(fh.dtype)], dim=1)
         mask = torch.cat([am, extra], dim=1)
         return vl, mask
 
@@ -1001,8 +1005,8 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         """Clear ALL memory banks (every episode). Call at episode start in streaming evaluation."""
         # self._infer_timestep = 0
         if self.use_memory:
-            self.cog_mem_bank.reset()
-            self.per_mem_bank.reset()
+            self.obs2_mem_bank.reset()
+            self.obs1_mem_bank.reset()
             if self.use_geoplan and hasattr(self, "geo_mem_bank"):
                 self.geo_mem_bank.reset()
 
@@ -1013,8 +1017,8 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
     def clear_episode_memory(self, episode_id) -> None:
         """Drop the memory of a single finished episode (use with parallel-env streaming eval)."""
         if self.use_memory:
-            self.cog_mem_bank.clear_episode(episode_id)
-            self.per_mem_bank.clear_episode(episode_id)
+            self.obs2_mem_bank.clear_episode(episode_id)
+            self.obs1_mem_bank.clear_episode(episode_id)
             if self.use_geoplan and hasattr(self, "geo_mem_bank"):
                 self.geo_mem_bank.clear_episode(episode_id)
 
@@ -1055,20 +1059,20 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         # target. The dataloader packs it per-sample as [T, 23]; only frame 0 (current) is used.
         campose = [example["campose"] for example in examples] if "campose" in examples[0] else None
 
-        cog, per, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
-        episode_ids, timesteps = self._episode_meta(examples, cog.device)
-        event_aux, event_prior = self._event_memory_inputs(examples, cog.device)
+        obs2, obs1, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
+        episode_ids, timesteps = self._episode_meta(examples, obs2.device)
+        event_aux, event_prior = self._event_memory_inputs(examples, obs2.device)
         self._maybe_debug_batch_layout(episode_ids, timesteps)
         # Group-mode training: clear the bank at the start of every batch (each batch is fresh groups).
-        cog, per, geo_guidance = self._apply_memory_and_fusion(
-            cog, per, geo_cond, episode_ids, timesteps,
+        obs2, obs1, geo_guidance = self._apply_memory_and_fusion(
+            obs2, obs1, geo_cond, episode_ids, timesteps,
             reset_before_batch=(self.mem_dataloader_type == "group"),
             update_state=True,
             event_aux=event_aux,
             event_prior=event_prior,
         )
 
-        vl_embs, enc_mask0 = self._build_action_context(cog, per, full_hidden, attn_mask)
+        vl_embs, enc_mask0 = self._build_action_context(obs2, obs1, full_hidden, attn_mask)
 
         with torch.autocast("cuda", dtype=torch.float32):
             actions_t = torch.tensor(np.array(actions), device=vl_embs.device, dtype=vl_embs.dtype)
@@ -1169,22 +1173,22 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        cog, per, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
-        episode_ids, timesteps = self._episode_meta(examples, cog.device)
-        event_aux, event_prior = self._event_memory_inputs(examples, cog.device)
+        obs2, obs1, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
+        episode_ids, timesteps = self._episode_meta(examples, obs2.device)
+        event_aux, event_prior = self._event_memory_inputs(examples, obs2.device)
         # if self.eval_memory_mode == "streaming":
         #     timesteps = np.array([self._infer_timestep] * len(examples), dtype=np.int64)
         #     self._infer_timestep += 1
         # Inference: stateless mode already reset above; streaming mode accumulates across steps and
         # expects reset_episode_memory() at episode boundaries. Never reset_before_batch mid-episode.
-        cog, per, _geo_guidance = self._apply_memory_and_fusion(
-            cog, per, geo_cond, episode_ids, timesteps,
+        obs2, obs1, _geo_guidance = self._apply_memory_and_fusion(
+            obs2, obs1, geo_cond, episode_ids, timesteps,
             reset_before_batch=False,
             update_state=(self.eval_memory_mode == "streaming"),
             event_aux=event_aux,
             event_prior=event_prior,
         )
-        vl_embs, enc_mask = self._build_action_context(cog, per, full_hidden, attn_mask)
+        vl_embs, enc_mask = self._build_action_context(obs2, obs1, full_hidden, attn_mask)
 
         # AAC multi-sample: draw `n_samples` candidate action chunks in parallel.
         # The backbone + memory above ran ONCE (batch == len(examples)); only the
@@ -1241,17 +1245,17 @@ class Qwen_GeoGR00T_RoboTwin(baseframework):
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
-        cog, per, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
-        episode_ids, timesteps = self._episode_meta(examples, cog.device)
-        event_aux, event_prior = self._event_memory_inputs(examples, cog.device)
+        obs2, obs1, geo_cond, full_hidden, attn_mask = self._encode_and_extract(batch_images, instructions)
+        episode_ids, timesteps = self._episode_meta(examples, obs2.device)
+        event_aux, event_prior = self._event_memory_inputs(examples, obs2.device)
         # Reproduce predict_action's memory/fusion so geo_guidance matches deployment behaviour.
         # IMPORTANT: by default do NOT write this frame into the memory bank — predict_geo is a
         # visualization/ablation hook, and if it were called alongside predict_action during a
         # streaming rollout it would double-write the current frame (inflating memory length and
         # corrupting retrieval). Pass update_memory=True only for a standalone geo-only stream.
         _update_mem = bool(kwargs.get("update_memory", False)) and (self.eval_memory_mode == "streaming")
-        _cog, _per, geo_guidance = self._apply_memory_and_fusion(
-            cog, per, geo_cond, episode_ids, timesteps,
+        _obs2, _obs1, geo_guidance = self._apply_memory_and_fusion(
+            obs2, obs1, geo_cond, episode_ids, timesteps,
             reset_before_batch=False,
             update_state=_update_mem,
             event_aux=event_aux,

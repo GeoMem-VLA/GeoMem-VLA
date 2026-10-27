@@ -196,7 +196,7 @@ class PolicyServerWrapper:
             "default_unnorm_key": self._default_unnorm_key,
             "event_aux_dim": int(geoplan_cfg.get("event_aux_dim", 0)),
             "eval_memory_mode": getattr(self._framework, "eval_memory_mode", None),
-            "eval_mem_length": getattr(getattr(self._framework, "cog_mem_bank", None), "mem_length", None),
+            "eval_mem_length": getattr(getattr(self._framework, "obs2_mem_bank", None), "mem_length", None),
             "num_inference_timesteps": getattr(getattr(self._framework, "action_model", None), "num_inference_timesteps", None),
             "eval_seed": _EVAL_SEED,
             "geo_history_intervention": getattr(self._framework, "geo_history_intervention", "none"),

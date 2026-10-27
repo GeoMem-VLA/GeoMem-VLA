@@ -2711,7 +2711,7 @@ class LeRobotMixtureDataset(Dataset):
             #   consecutive   (default) -> a contiguous stride-1 window [start, start+group_size).
             #                  Legacy behaviour; the memory bank only ever sees the IMMEDIATE past.
             #   random_sorted -> group_size DISTINCT frames sampled uniformly over the WHOLE
-            #                  trajectory, sorted by time (MemoryVLA's use_optim_group_sample).
+            #                  trajectory, sorted by time.
             #                  The memory bank then trains on sparse long-range history with
             #                  variable timestep gaps -- matching what a STREAMING rollout's bank
             #                  looks like, which is what makes streaming inference work.

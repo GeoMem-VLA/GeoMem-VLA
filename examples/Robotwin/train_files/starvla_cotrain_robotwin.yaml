@@ -51,8 +51,8 @@ framework:
     eef_waypoint_scale: 1.0
     geo_num_queries: 16
     geo_work_dim: 512
-    per_num_tokens: 64
-    per_resampler_layers: 2
+    obs1_num_tokens: 64
+    obs1_resampler_layers: 2
     geo_grid_size: 16
     geo_head_hidden: 512
     geo_head_depth: 4

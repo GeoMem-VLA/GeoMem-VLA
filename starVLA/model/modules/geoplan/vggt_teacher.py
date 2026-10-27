@@ -1,6 +1,6 @@
 """Frozen VGGT teacher that produces 3D geometry targets online during training.
 
-The teacher is intentionally kept *outside* the registered ``nn.Module`` tree of ``MemoryVLA``
+The teacher is intentionally kept *outside* the registered ``nn.Module`` tree of the policy model
 (it is held inside a plain python list attribute) so that:
   * FSDP / ``.to()`` / ``state_dict()`` never touch it (it is frozen and never saved);
   * ``train.py``'s "all params must be fp32" assertion is unaffected.

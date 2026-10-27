@@ -52,7 +52,7 @@ class GeoInseqBridge(nn.Module):
 
     Holds K learnable special tokens (appended into the LLM sequence) and a projection from the LLM
     hidden dim to the geo work dim. Wrapping these in a module (rather than bare parameters on the
-    root) ensures they are captured by MemoryVLA's checkpoint save/load (which iterates child
+    root) ensures they are captured by the framework's checkpoint save/load (which iterates child
     modules).
     """
 
