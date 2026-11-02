@@ -244,6 +244,12 @@ deployment/model_server/   # Policy loading and WebSocket inference
 
 Additional StarVLA model implementations are retained alongside the GeoMem-VLA workflow. See [release notes](RELEASE_NOTES.md) for the scope of this source release.
 
+## 📬 Contact With Us
+
+For questions, collaborations, or release updates, please open an issue or contact the authors after the repository is public.
+
+Email contact: {haoyuan.shi, xiancong.ren}@x-humanoid.com
+
 ## Acknowledgments
 
 This project builds on StarVLA and uses Qwen3-VL, VGGT, LIBERO, and RoboTwin components. Upstream attribution is preserved. The existing [CITATION.cff](CITATION.cff) describes **upstream StarVLA**, not a separate GeoMem-VLA publication.
