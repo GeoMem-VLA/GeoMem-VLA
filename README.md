@@ -248,7 +248,7 @@ Additional StarVLA model implementations are retained alongside the GeoMem-VLA w
 
 For questions, collaborations, or release updates, please open an issue or contact the authors after the repository is public.
 
-Email contact: {haoyuan.shi, xiancong.ren}@x-humanoid.com
+Email contact: zhangqf2001@gmail.com, xiancong.ren@x-humanoid.com
 
 ## Acknowledgments
 
