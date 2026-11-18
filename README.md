@@ -222,7 +222,7 @@ Gradient accumulation increases the effective batch size, but does not extend th
 
 Shared GeoPlan defaults: **16 query tokens**, **512 hidden dimensions**, **4 head layers**, and **8 attention heads**. Visual observation features (obs1) are resampled to 64 tokens. Geometry diagnostic probes are disabled by default.
 
-Data loading uses 4 workers with a prefetch factor of 2. Warmup lasts 100 steps, and checkpoints are saved every 1,000 steps. LIBERO uses action-derived EEF auxiliary targets; RoboTwin disables EEF supervision for the official joint-space data.
+Data loading uses 4 workers with a prefetch factor of 2. Warmup lasts 100 steps, and checkpoints are saved every 1,000 steps. LIBERO uses action-derived EEF auxiliary targets; RoboTwin disables EEF supervision for the official joint-space data. An optional RoboTwin configuration that maps the EEF track into the VGGT point-cloud frame is described in the [RoboTwin guide](examples/Robotwin/README.md#optional-eef-track-in-the-vggt-point-cloud-frame).
 
 </details>
 

@@ -6,7 +6,7 @@ cd "${ROOT}"
 export PYTHONPATH="${ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE="${WANDB_MODE:-disabled}"
 
-benchmark="${1:?Expected LIBERO or Robotwin}"
+benchmark="${1:?Expected LIBERO, Robotwin or RobotwinV2}"
 case "${benchmark}" in
   LIBERO)
     config="examples/LIBERO/train_files/starvla_cotrain_libero.yaml"
@@ -21,6 +21,18 @@ case "${benchmark}" in
     accumulation="${GRADIENT_ACCUMULATION_STEPS:-8}"
     # The basic recipe uses official joint-space data, without an EEF column.
     export ROBOTWIN_USE_EEF=0
+    ;;
+  RobotwinV2)
+    # Optional research configuration: the future EEF track is mapped into the VGGT point-map
+    # frame (see examples/Robotwin/README.md). The dataset needs observation.eef and
+    # observation.campose columns; the data mixture reads them itself.
+    config="examples/Robotwin/train_files/starvla_robotwin_v2.yaml"
+    data_root="${ROBOTWIN_DATA_ROOT:?Set ROBOTWIN_DATA_ROOT to the LeRobot dataset root}"
+    data_mix="${DATA_MIX:-robotwin_all_50_v2}"
+    accumulation="${GRADIENT_ACCUMULATION_STEPS:-8}"
+    default_run_id="Robotwin_geomem_eef_pointcloud"
+    # This configuration uses batch/group/memory 8/8/8; the usual environment variables override it.
+    : "${PER_DEVICE_BATCH_SIZE:=8}" "${GROUP_SIZE:=8}"
     ;;
   *) echo "Unknown benchmark: ${benchmark}" >&2; exit 2 ;;
 esac
@@ -66,4 +78,4 @@ exec accelerate launch \
   --trainer.save_interval "${SAVE_INTERVAL:-1000}" \
   --trainer.is_resume "${IS_RESUME:-False}" \
   --run_root_dir "${RUN_ROOT_DIR:-results/Checkpoints}" \
-  --run_id "${RUN_ID:-${benchmark}_geomem_basic}"
+  --run_id "${RUN_ID:-${default_run_id:-${benchmark}_geomem_basic}}"
